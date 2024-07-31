@@ -248,8 +248,11 @@ def encodings_to_label_list(pred_entities, encoding, id2label=None):
         else:
             logger.error(f'Passed predictions are of type {type(pred_entities[0])}, which is unsupported.')
 
-    last_word_id = next(x for x in reversed(encoding.word_ids)
-                        if x is not None)
+    try:
+        last_word_id = next(x for x in reversed(encoding.word_ids)
+                            if x is not None)
+    except StopIteration:
+        last_word_id = 0
 
     for word_id in range(last_word_id):
         # all indices corresponding to the same word
