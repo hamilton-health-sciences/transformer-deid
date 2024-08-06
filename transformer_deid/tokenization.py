@@ -138,34 +138,35 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     logger.info('Determining offsets for splitting long segments.')
     for i, encoded in tqdm(enumerate(encodings.encodings),
                            total=len(encodings.encodings)):
-        with time_limit(10):
-            offsets = [o[0] for o in encoded.offsets]
-            token_sw = [False] + [
-                encoded.word_ids[i + 1] == encoded.word_ids[i]
-                for i in range(len(encoded.word_ids) - 1)
-            ]
-            # iterate through text and add create new subsets of the text
-            start = 0
-            subseq = []
-            while start < len(offsets):
-                # ensure we do not start on a sub-word token
-                while token_sw[start]:
-                    start -= 1
-
-                stop = start + seq_len
-                if stop < len(offsets):
-                    # ensure we don't split sequences on a sub-word token
-                    # do this by shortening the current sequence
-                    while token_sw[stop]:
-                        stop -= 1
-                else:
-                    # end the sub sequence at the end of the text
-                    stop = len(offsets)
-
-                subseq.append(start)
-
-                # update start of next sequence to be end of current one
-                start = stop
+        try:
+            with time_limit(10):
+                offsets = [o[0] for o in encoded.offsets]
+                token_sw = [False] + [
+                    encoded.word_ids[i + 1] == encoded.word_ids[i]
+                    for i in range(len(encoded.word_ids) - 1)
+                ]
+                # iterate through text and add create new subsets of the text
+                start = 0
+                subseq = []
+                while start < len(offsets):
+                    # ensure we do not start on a sub-word token
+                    while token_sw[start]:
+                        start -= 1
+    
+                    stop = start + seq_len
+                    if stop < len(offsets):
+                        # ensure we don't split sequences on a sub-word token
+                        # do this by shortening the current sequence
+                        while token_sw[stop]:
+                            stop -= 1
+                    else:
+                        # end the sub sequence at the end of the text
+                        stop = len(offsets)
+    
+                    subseq.append(start)
+    
+                    # update start of next sequence to be end of current one
+                    start = stop
         except TimeoutException:
             subseq = [0]
 
