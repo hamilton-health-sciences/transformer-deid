@@ -139,7 +139,7 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     for i, encoded in tqdm(enumerate(encodings.encodings),
                            total=len(encodings.encodings)):
         try:
-            with time_limit(10):
+            with time_limit(30):
                 offsets = [o[0] for o in encoded.offsets]
                 token_sw = [False] + [
                     encoded.word_ids[i + 1] == encoded.word_ids[i]
@@ -168,6 +168,7 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
                     # update start of next sequence to be end of current one
                     start = stop
         except TimeoutException:
+            logger.warning("Offset calculation exceeded 30s; falling back to unsplit sequence for index %s.", i)
             subseq = [0]
 
         sequence_offsets.append(subseq)
