@@ -1,7 +1,7 @@
 from bisect import bisect_left, bisect_right
 import logging
-import signal
-from contextlib import contextmanager
+import multiprocessing as mp
+import os
 import numpy as np
 import copy
 from typing import List, Optional, Union, TextIO
@@ -10,19 +10,7 @@ from tqdm import tqdm
 from transformer_deid.label import Label
 
 
-class TimeoutException(Exception): pass
-
-@contextmanager
-def time_limit(seconds):
-    def signal_handler(signum, frame):
-        raise TimeoutException("Timed out!")
-
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
+MAX_SPLIT_PROCESSES = max(1, int(os.getenv("MAX_SPLIT_PROCESSES", "32")))
 
 
 class DuplicateFilter(logging.Filter):
@@ -123,6 +111,31 @@ def assign_tags_to_single_text(encoding,
     return token_labels
 
 
+def _compute_subseq(args):
+    offsets, word_ids, seq_len = args
+    token_sw = [False]
+    token_sw += [
+        word_ids[i + 1] == word_ids[i]
+        for i in range(len(word_ids) - 1)
+    ]
+    start = 0
+    subseq = []
+    while start < len(offsets):
+        while token_sw[start]:
+            start -= 1
+
+        stop = start + seq_len
+        if stop < len(offsets):
+            while token_sw[stop]:
+                stop -= 1
+        else:
+            stop = len(offsets)
+
+        subseq.append(start)
+        start = stop
+    return subseq
+
+
 def split_sequences(tokenizer, texts, labels=None, ids=None):
     """
     Split long texts into subtexts of max length.
@@ -136,42 +149,22 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     # identify the start/stop offsets of the new text
     sequence_offsets = []
     logger.info('Determining offsets for splitting long segments.')
-    for i, encoded in tqdm(enumerate(encodings.encodings),
-                           total=len(encodings.encodings)):
-        try:
-            with time_limit(30):
-                offsets = [o[0] for o in encoded.offsets]
-                token_sw = [False] + [
-                    encoded.word_ids[i + 1] == encoded.word_ids[i]
-                    for i in range(len(encoded.word_ids) - 1)
-                ]
-                # iterate through text and add create new subsets of the text
-                start = 0
-                subseq = []
-                while start < len(offsets):
-                    # ensure we do not start on a sub-word token
-                    while token_sw[start]:
-                        start -= 1
-    
-                    stop = start + seq_len
-                    if stop < len(offsets):
-                        # ensure we don't split sequences on a sub-word token
-                        # do this by shortening the current sequence
-                        while token_sw[stop]:
-                            stop -= 1
-                    else:
-                        # end the sub sequence at the end of the text
-                        stop = len(offsets)
-    
-                    subseq.append(start)
-    
-                    # update start of next sequence to be end of current one
-                    start = stop
-        except TimeoutException:
-            logger.warning("Offset calculation exceeded 30s; falling back to unsplit sequence for index %s.", i)
-            subseq = [0]
+    worker_inputs = []
+    for encoded in encodings.encodings:
+        offsets = [o[0] for o in encoded.offsets]
+        word_ids = list(encoded.word_ids)
+        worker_inputs.append((offsets, word_ids, seq_len))
 
-        sequence_offsets.append(subseq)
+    if len(worker_inputs) <= 1:
+        sequence_offsets = [_compute_subseq(worker_inputs[0])] if worker_inputs else []
+    else:
+        process_count = min(MAX_SPLIT_PROCESSES, os.cpu_count() or MAX_SPLIT_PROCESSES, len(worker_inputs))
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=process_count) as pool:
+            sequence_offsets = list(
+                tqdm(pool.imap(_compute_subseq, worker_inputs, chunksize=1),
+                     total=len(worker_inputs))
+            )
 
     new_text = []
     new_labels = []
