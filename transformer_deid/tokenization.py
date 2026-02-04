@@ -115,13 +115,17 @@ def assign_tags_to_single_text(encoding,
 def _compute_subseq(args):
     offsets, word_ids, seq_len, index = args
     start_time = time.perf_counter()
-    token_sw = [False]
-    token_sw += [
-        (word_ids[i + 1] is not None) and
-        (word_ids[i] is not None) and
-        (word_ids[i + 1] == word_ids[i])
-        for i in range(len(word_ids) - 1)
-    ]
+    non_none_word_ids = [wid for wid in word_ids if wid is not None]
+    if not non_none_word_ids or len(set(non_none_word_ids)) <= 1:
+        token_sw = [False] * len(word_ids)
+    else:
+        token_sw = [False]
+        token_sw += [
+            (word_ids[i + 1] is not None) and
+            (word_ids[i] is not None) and
+            (word_ids[i + 1] == word_ids[i])
+            for i in range(len(word_ids) - 1)
+        ]
     start = 0
     subseq = []
     max_iters = len(offsets) + 5
@@ -176,7 +180,7 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     encodings = tokenizer(texts, add_special_tokens=False)
     tokenization_duration = time.perf_counter() - t0
     seq_len = tokenizer.max_len_single_sentence
-    logger.info(
+    logger.debug(
         "Tokenization completed in %.2fs for %s document(s); max_len_single_sentence=%s.",
         tokenization_duration,
         len(texts),
@@ -205,7 +209,7 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
             )
 
     for result in sequence_offsets:
-        logger.info(
+        logger.debug(
             "Split offsets computed for doc index %s in %.3fs (tokens=%s).",
             result["index"],
             result["duration_s"],
@@ -292,15 +296,47 @@ def encodings_to_label_list(pred_entities, encoding, id2label=None):
         else:
             logger.error(f'Passed predictions are of type {type(pred_entities[0])}, which is unsupported.')
 
+    word_ids = list(encoding.word_ids)
+    non_none_word_ids = [wid for wid in word_ids if wid is not None]
+    if not non_none_word_ids or len(set(non_none_word_ids)) <= 1:
+        # Fallback: derive labels directly from token offsets when word_ids are unusable.
+        current_entity = None
+        current_start = None
+        current_end = None
+        for i, entity in enumerate(pred_entities):
+            start, end = encoding.offsets[i]
+            if start == end:
+                continue
+            if entity in ('O', 'PAD'):
+                if current_entity is not None:
+                    labels.append(Label(current_entity, current_start,
+                                        current_end - current_start, ''))
+                    current_entity = None
+                continue
+            if current_entity == entity and start <= current_end:
+                current_end = end
+            else:
+                if current_entity is not None:
+                    labels.append(Label(current_entity, current_start,
+                                        current_end - current_start, ''))
+                current_entity = entity
+                current_start = start
+                current_end = end
+
+        if current_entity is not None:
+            labels.append(Label(current_entity, current_start,
+                                current_end - current_start, ''))
+
+        return labels
+
     try:
-        last_word_id = next(x for x in reversed(encoding.word_ids)
-                            if x is not None)
+        last_word_id = next(x for x in reversed(word_ids) if x is not None)
     except StopIteration:
         last_word_id = 0
 
     for word_id in range(last_word_id):
         # all indices corresponding to the same word
-        idxs = [i for i, x in enumerate(encoding.word_ids) if x == word_id]
+        idxs = [i for i, x in enumerate(word_ids) if x == word_id]
 
         # get first entity only
         new_entity = pred_entities[idxs[0]]
