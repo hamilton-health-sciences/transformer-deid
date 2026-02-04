@@ -122,16 +122,33 @@ def _compute_subseq(args):
     ]
     start = 0
     subseq = []
+    max_iters = len(offsets) + 5
+    iter_count = 0
     while start < len(offsets):
+        iter_count += 1
+        if iter_count > max_iters:
+            logger.warning(
+                "Offset splitting exceeded max iterations (doc index %s, tokens=%s).",
+                index,
+                len(offsets),
+            )
+            break
         while token_sw[start]:
+            if start == 0:
+                break
             start -= 1
 
         stop = start + seq_len
         if stop < len(offsets):
             while token_sw[stop]:
+                if stop == 0:
+                    break
                 stop -= 1
         else:
             stop = len(offsets)
+
+        if stop <= start:
+            stop = min(len(offsets), start + 1)
 
         subseq.append(start)
         start = stop
@@ -149,8 +166,13 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     t0 = time.perf_counter()
     encodings = tokenizer(texts, add_special_tokens=False)
     tokenization_duration = time.perf_counter() - t0
-    logger.info("Tokenization completed in %.2fs for %s document(s).", tokenization_duration, len(texts))
     seq_len = tokenizer.max_len_single_sentence
+    logger.info(
+        "Tokenization completed in %.2fs for %s document(s); max_len_single_sentence=%s.",
+        tokenization_duration,
+        len(texts),
+        seq_len,
+    )
 
     # identify the start/stop offsets of the new text
     sequence_offsets = []
