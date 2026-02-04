@@ -117,7 +117,9 @@ def _compute_subseq(args):
     start_time = time.perf_counter()
     token_sw = [False]
     token_sw += [
-        word_ids[i + 1] == word_ids[i]
+        (word_ids[i + 1] is not None) and
+        (word_ids[i] is not None) and
+        (word_ids[i + 1] == word_ids[i])
         for i in range(len(word_ids) - 1)
     ]
     start = 0
@@ -141,14 +143,14 @@ def _compute_subseq(args):
         stop = start + seq_len
         if stop < len(offsets):
             while token_sw[stop]:
-                if stop == 0:
+                if stop <= start:
                     break
                 stop -= 1
         else:
             stop = len(offsets)
 
         if stop <= start:
-            stop = min(len(offsets), start + 1)
+            stop = min(len(offsets), start + seq_len)
 
         subseq.append(start)
         start = stop
