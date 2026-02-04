@@ -2,6 +2,7 @@ from bisect import bisect_left, bisect_right
 import logging
 import multiprocessing as mp
 import os
+import time
 import numpy as np
 import copy
 from typing import List, Optional, Union, TextIO
@@ -112,7 +113,8 @@ def assign_tags_to_single_text(encoding,
 
 
 def _compute_subseq(args):
-    offsets, word_ids, seq_len = args
+    offsets, word_ids, seq_len, index = args
+    start_time = time.perf_counter()
     token_sw = [False]
     token_sw += [
         word_ids[i + 1] == word_ids[i]
@@ -133,7 +135,8 @@ def _compute_subseq(args):
 
         subseq.append(start)
         start = stop
-    return subseq
+    duration = time.perf_counter() - start_time
+    return {"index": index, "subseq": subseq, "token_count": len(offsets), "duration_s": duration}
 
 
 def split_sequences(tokenizer, texts, labels=None, ids=None):
@@ -143,20 +146,24 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     Return new list of split texts and new list of labels (if applicable).
     """
     # tokenize the text
+    t0 = time.perf_counter()
     encodings = tokenizer(texts, add_special_tokens=False)
+    tokenization_duration = time.perf_counter() - t0
+    logger.info("Tokenization completed in %.2fs for %s document(s).", tokenization_duration, len(texts))
     seq_len = tokenizer.max_len_single_sentence
 
     # identify the start/stop offsets of the new text
     sequence_offsets = []
     logger.info('Determining offsets for splitting long segments.')
     worker_inputs = []
-    for encoded in encodings.encodings:
+    for idx, encoded in enumerate(encodings.encodings):
         offsets = [o[0] for o in encoded.offsets]
         word_ids = list(encoded.word_ids)
-        worker_inputs.append((offsets, word_ids, seq_len))
+        worker_inputs.append((offsets, word_ids, seq_len, idx))
 
     if len(worker_inputs) <= 1:
-        sequence_offsets = [_compute_subseq(worker_inputs[0])] if worker_inputs else []
+        result = _compute_subseq(worker_inputs[0]) if worker_inputs else None
+        sequence_offsets = [result] if result else []
     else:
         process_count = min(MAX_SPLIT_PROCESSES, os.cpu_count() or MAX_SPLIT_PROCESSES, len(worker_inputs))
         ctx = mp.get_context("fork")
@@ -165,6 +172,17 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
                 tqdm(pool.imap(_compute_subseq, worker_inputs, chunksize=1),
                      total=len(worker_inputs))
             )
+
+    for result in sequence_offsets:
+        logger.info(
+            "Split offsets computed for doc index %s in %.3fs (tokens=%s).",
+            result["index"],
+            result["duration_s"],
+            result["token_count"],
+        )
+
+    if sequence_offsets:
+        sequence_offsets = [r["subseq"] for r in sorted(sequence_offsets, key=lambda r: r["index"])]
 
     new_text = []
     new_labels = []
