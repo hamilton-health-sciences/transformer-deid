@@ -126,13 +126,19 @@ def _compute_subseq(args):
     subseq = []
     max_iters = len(offsets) + 5
     iter_count = 0
+    last_stop = None
     while start < len(offsets):
         iter_count += 1
         if iter_count > max_iters:
+            true_count = sum(token_sw)
             logger.warning(
-                "Offset splitting exceeded max iterations (doc index %s, tokens=%s).",
+                "Offset splitting exceeded max iterations (doc index %s, tokens=%s, seq_len=%s, last_start=%s, last_stop=%s, subword_tokens=%s).",
                 index,
                 len(offsets),
+                seq_len,
+                start,
+                last_stop,
+                true_count,
             )
             break
         while token_sw[start]:
@@ -153,6 +159,7 @@ def _compute_subseq(args):
             stop = min(len(offsets), start + seq_len)
 
         subseq.append(start)
+        last_stop = stop
         start = stop
     duration = time.perf_counter() - start_time
     return {"index": index, "subseq": subseq, "token_count": len(offsets), "duration_s": duration}
