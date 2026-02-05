@@ -4,6 +4,7 @@ import os
 import numpy as np
 from pathlib import Path
 import logging
+from collections import Counter
 from tqdm import tqdm
 from huggingface_hub import login
 from transformer_deid.data import DeidDataset
@@ -29,6 +30,10 @@ def annotate(model, test_dataset: DeidDataset, device):
     model = model.to(device)
     model.eval()
 
+    logger.debug("Model num_labels=%s", getattr(model.config, "num_labels", None))
+    logger.debug("Model id2label=%s", getattr(model.config, "id2label", None))
+    logger.debug("Model label2id=%s", getattr(model.config, "label2id", None))
+
     logger.info(
         f'Running predictions over {len(test_dataset.encodings.encodings)} split sequences from {len(test_dataset.ids)} documents.'
     )
@@ -42,6 +47,27 @@ def annotate(model, test_dataset: DeidDataset, device):
     id2label = model.config.id2label
     predicted_label = [[id2label[token] for token in doc]
                        for doc in predicted_label]
+    flat_labels = [label for doc in predicted_label for label in doc]
+    label_counts = Counter(flat_labels)
+    logger.debug("Predicted label counts (top 10): %s", label_counts.most_common(10))
+    if result:
+        first_logits = result[0]
+        max_logits = np.max(first_logits, axis=1)
+        mean_max_logit = float(np.mean(max_logits))
+        std_max_logit = float(np.std(max_logits))
+        sample_len = min(50, len(predicted_label[0]))
+        sample_counts = Counter(predicted_label[0][:sample_len]).most_common(5)
+        logger.debug(
+            "First sequence logits: mean max=%.4f std max=%.4f (len=%s).",
+            mean_max_logit,
+            std_max_logit,
+            first_logits.shape[0],
+        )
+        logger.debug(
+            "First sequence sample label counts (first %s tokens): %s",
+            sample_len,
+            sample_counts,
+        )
 
     labels = [encodings_to_label_list(doc, test_dataset.encodings[i], id2label=id2label) for i, doc in enumerate(predicted_label)]
 
@@ -85,7 +111,21 @@ def main(args):
     out_path = args.output_path
     modelDir = args.model_path
     baseArchitecture = os.path.basename(modelDir).split('-')[0].lower()
-    _, tokenizer, _ = which_transformer_arch(baseArchitecture)
+    _, _, base_model_name = which_transformer_arch(baseArchitecture)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(modelDir, use_fast=True)
+        probe = tokenizer("probe", add_special_tokens=False)
+        if getattr(tokenizer, "vocab_size", 0) in (0, None) or not probe.get("input_ids"):
+            raise ValueError("Tokenizer appears unusable.")
+        logger.debug("Tokenizer loaded from model path: %s", modelDir)
+    except Exception as exc:
+        logger.warning(
+            "Failed to load tokenizer from model path (%s); falling back to base tokenizer %s. Error: %s",
+            modelDir,
+            base_model_name,
+            exc,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=True)
 
     data_dict = load_data(Path(train_path))
     test_dataset = create_deid_dataset(data_dict, tokenizer)
@@ -94,6 +134,7 @@ def main(args):
     logger.info(f'Running using {device}.')
 
     model = AutoModelForTokenClassification.from_pretrained(modelDir)
+    logger.debug("Model loaded from: %s", getattr(model.config, "_name_or_path", None))
 
     annotations = annotate(model, test_dataset, device)
 

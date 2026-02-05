@@ -1,7 +1,8 @@
 from bisect import bisect_left, bisect_right
 import logging
-import signal
-from contextlib import contextmanager
+import multiprocessing as mp
+import os
+import time
 import numpy as np
 import copy
 from typing import List, Optional, Union, TextIO
@@ -10,19 +11,7 @@ from tqdm import tqdm
 from transformer_deid.label import Label
 
 
-class TimeoutException(Exception): pass
-
-@contextmanager
-def time_limit(seconds):
-    def signal_handler(signum, frame):
-        raise TimeoutException("Timed out!")
-
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
+MAX_SPLIT_PROCESSES = max(1, int(os.getenv("MAX_SPLIT_PROCESSES", "32")))
 
 
 class DuplicateFilter(logging.Filter):
@@ -123,6 +112,63 @@ def assign_tags_to_single_text(encoding,
     return token_labels
 
 
+def _compute_subseq(args):
+    offsets, word_ids, seq_len, index = args
+    start_time = time.perf_counter()
+    non_none_word_ids = [wid for wid in word_ids if wid is not None]
+    if not non_none_word_ids or len(set(non_none_word_ids)) <= 1:
+        token_sw = [False] * len(word_ids)
+    else:
+        token_sw = [False]
+        token_sw += [
+            (word_ids[i + 1] is not None) and
+            (word_ids[i] is not None) and
+            (word_ids[i + 1] == word_ids[i])
+            for i in range(len(word_ids) - 1)
+        ]
+    start = 0
+    subseq = []
+    max_iters = len(offsets) + 5
+    iter_count = 0
+    last_stop = None
+    while start < len(offsets):
+        iter_count += 1
+        if iter_count > max_iters:
+            true_count = sum(token_sw)
+            logger.warning(
+                "Offset splitting exceeded max iterations (doc index %s, tokens=%s, seq_len=%s, last_start=%s, last_stop=%s, subword_tokens=%s).",
+                index,
+                len(offsets),
+                seq_len,
+                start,
+                last_stop,
+                true_count,
+            )
+            break
+        while token_sw[start]:
+            if start == 0:
+                break
+            start -= 1
+
+        stop = start + seq_len
+        if stop < len(offsets):
+            while token_sw[stop]:
+                if stop <= start:
+                    break
+                stop -= 1
+        else:
+            stop = len(offsets)
+
+        if stop <= start:
+            stop = min(len(offsets), start + seq_len)
+
+        subseq.append(start)
+        last_stop = stop
+        start = stop
+    duration = time.perf_counter() - start_time
+    return {"index": index, "subseq": subseq, "token_count": len(offsets), "duration_s": duration}
+
+
 def split_sequences(tokenizer, texts, labels=None, ids=None):
     """
     Split long texts into subtexts of max length.
@@ -130,48 +176,48 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     Return new list of split texts and new list of labels (if applicable).
     """
     # tokenize the text
+    t0 = time.perf_counter()
     encodings = tokenizer(texts, add_special_tokens=False)
+    tokenization_duration = time.perf_counter() - t0
     seq_len = tokenizer.max_len_single_sentence
+    logger.debug(
+        "Tokenization completed in %.2fs for %s document(s); max_len_single_sentence=%s.",
+        tokenization_duration,
+        len(texts),
+        seq_len,
+    )
 
     # identify the start/stop offsets of the new text
     sequence_offsets = []
     logger.info('Determining offsets for splitting long segments.')
-    for i, encoded in tqdm(enumerate(encodings.encodings),
-                           total=len(encodings.encodings)):
-        try:
-            with time_limit(30):
-                offsets = [o[0] for o in encoded.offsets]
-                token_sw = [False] + [
-                    encoded.word_ids[i + 1] == encoded.word_ids[i]
-                    for i in range(len(encoded.word_ids) - 1)
-                ]
-                # iterate through text and add create new subsets of the text
-                start = 0
-                subseq = []
-                while start < len(offsets):
-                    # ensure we do not start on a sub-word token
-                    while token_sw[start]:
-                        start -= 1
-    
-                    stop = start + seq_len
-                    if stop < len(offsets):
-                        # ensure we don't split sequences on a sub-word token
-                        # do this by shortening the current sequence
-                        while token_sw[stop]:
-                            stop -= 1
-                    else:
-                        # end the sub sequence at the end of the text
-                        stop = len(offsets)
-    
-                    subseq.append(start)
-    
-                    # update start of next sequence to be end of current one
-                    start = stop
-        except TimeoutException:
-            logger.warning("Offset calculation exceeded 30s; falling back to unsplit sequence for index %s.", i)
-            subseq = [0]
+    worker_inputs = []
+    for idx, encoded in enumerate(encodings.encodings):
+        offsets = [o[0] for o in encoded.offsets]
+        word_ids = list(encoded.word_ids)
+        worker_inputs.append((offsets, word_ids, seq_len, idx))
 
-        sequence_offsets.append(subseq)
+    if len(worker_inputs) <= 1:
+        result = _compute_subseq(worker_inputs[0]) if worker_inputs else None
+        sequence_offsets = [result] if result else []
+    else:
+        process_count = min(MAX_SPLIT_PROCESSES, os.cpu_count() or MAX_SPLIT_PROCESSES, len(worker_inputs))
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=process_count) as pool:
+            sequence_offsets = list(
+                tqdm(pool.imap(_compute_subseq, worker_inputs, chunksize=1),
+                     total=len(worker_inputs))
+            )
+
+    for result in sequence_offsets:
+        logger.debug(
+            "Split offsets computed for doc index %s in %.3fs (tokens=%s).",
+            result["index"],
+            result["duration_s"],
+            result["token_count"],
+        )
+
+    if sequence_offsets:
+        sequence_offsets = [r["subseq"] for r in sorted(sequence_offsets, key=lambda r: r["index"])]
 
     new_text = []
     new_labels = []
@@ -250,15 +296,47 @@ def encodings_to_label_list(pred_entities, encoding, id2label=None):
         else:
             logger.error(f'Passed predictions are of type {type(pred_entities[0])}, which is unsupported.')
 
+    word_ids = list(encoding.word_ids)
+    non_none_word_ids = [wid for wid in word_ids if wid is not None]
+    if not non_none_word_ids or len(set(non_none_word_ids)) <= 1:
+        # Fallback: derive labels directly from token offsets when word_ids are unusable.
+        current_entity = None
+        current_start = None
+        current_end = None
+        for i, entity in enumerate(pred_entities):
+            start, end = encoding.offsets[i]
+            if start == end:
+                continue
+            if entity in ('O', 'PAD'):
+                if current_entity is not None:
+                    labels.append(Label(current_entity, current_start,
+                                        current_end - current_start, ''))
+                    current_entity = None
+                continue
+            if current_entity == entity and start <= current_end:
+                current_end = end
+            else:
+                if current_entity is not None:
+                    labels.append(Label(current_entity, current_start,
+                                        current_end - current_start, ''))
+                current_entity = entity
+                current_start = start
+                current_end = end
+
+        if current_entity is not None:
+            labels.append(Label(current_entity, current_start,
+                                current_end - current_start, ''))
+
+        return labels
+
     try:
-        last_word_id = next(x for x in reversed(encoding.word_ids)
-                            if x is not None)
+        last_word_id = next(x for x in reversed(word_ids) if x is not None)
     except StopIteration:
         last_word_id = 0
 
     for word_id in range(last_word_id):
         # all indices corresponding to the same word
-        idxs = [i for i, x in enumerate(encoding.word_ids) if x == word_id]
+        idxs = [i for i, x in enumerate(word_ids) if x == word_id]
 
         # get first entity only
         new_entity = pred_entities[idxs[0]]
