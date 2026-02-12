@@ -2,6 +2,7 @@ import torch
 import argparse
 import os
 import numpy as np
+import io
 from pathlib import Path
 import logging
 from collections import Counter
@@ -14,6 +15,36 @@ from transformer_deid.load_data import load_data, create_deid_dataset, save_labe
 from transformer_deid.train import which_transformer_arch
 
 logger = logging.getLogger(__name__)
+
+
+class _TqdmToLogger(io.StringIO):
+    """File-like stream for sending tqdm updates to logging."""
+
+    def __init__(self, log, level=logging.INFO):
+        super().__init__()
+        self.log = log
+        self.level = level
+        self._buf = ""
+
+    def write(self, buf):
+        self._buf = buf.rstrip("\r\n\t ")
+
+    def flush(self):
+        if self._buf:
+            self.log.log(self.level, self._buf)
+        self._buf = ""
+
+
+def _progress(iterable, total=None):
+    if os.isatty(2):
+        return tqdm(iterable, total=total)
+    return tqdm(
+        iterable,
+        total=total,
+        file=_TqdmToLogger(logger),
+        mininterval=10.0,
+        dynamic_ncols=False,
+    )
 
 
 def annotate(model, test_dataset: DeidDataset, device):
@@ -39,8 +70,10 @@ def annotate(model, test_dataset: DeidDataset, device):
     )
     result = [
         get_logits(encoding, model, device)
-        for encoding in tqdm(test_dataset.encodings.encodings,
-                             total=len(test_dataset.encodings.encodings))
+        for encoding in _progress(
+            test_dataset.encodings.encodings,
+            total=len(test_dataset.encodings.encodings),
+        )
     ]
     predicted_label = np.argmax(result, axis=2)
 

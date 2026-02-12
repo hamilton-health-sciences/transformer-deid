@@ -1,4 +1,5 @@
 from bisect import bisect_left, bisect_right
+import io
 import logging
 import multiprocessing as mp
 import os
@@ -24,6 +25,36 @@ class DuplicateFilter(logging.Filter):
 
 logger = logging.getLogger(__name__)
 logger.addFilter(DuplicateFilter())
+
+
+class _TqdmToLogger(io.StringIO):
+    """File-like stream for sending tqdm updates to logging."""
+
+    def __init__(self, log, level=logging.INFO):
+        super().__init__()
+        self.log = log
+        self.level = level
+        self._buf = ""
+
+    def write(self, buf):
+        self._buf = buf.rstrip("\r\n\t ")
+
+    def flush(self):
+        if self._buf:
+            self.log.log(self.level, self._buf)
+        self._buf = ""
+
+
+def _progress(iterable, total=None):
+    if os.isatty(2):
+        return tqdm(iterable, total=total)
+    return tqdm(
+        iterable,
+        total=total,
+        file=_TqdmToLogger(logger),
+        mininterval=10.0,
+        dynamic_ncols=False,
+    )
 
 
 def encode_tags(tags, encodings, tag2id):
@@ -204,8 +235,10 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
         ctx = mp.get_context("fork")
         with ctx.Pool(processes=process_count) as pool:
             sequence_offsets = list(
-                tqdm(pool.imap(_compute_subseq, worker_inputs, chunksize=1),
-                     total=len(worker_inputs))
+                _progress(
+                    pool.imap(_compute_subseq, worker_inputs, chunksize=1),
+                    total=len(worker_inputs),
+                )
             )
 
     for result in sequence_offsets:
@@ -224,8 +257,10 @@ def split_sequences(tokenizer, texts, labels=None, ids=None):
     new_ids = []
 
     logger.info('Splitting text.')
-    for i, subseq in tqdm(enumerate(sequence_offsets),
-                          total=len(encodings.encodings)):
+    for i, subseq in _progress(
+        enumerate(sequence_offsets),
+        total=len(encodings.encodings),
+    ):
         # track the start indices of each set of labels in the document
         # so that the documents and their labels can be reconstructed
         if ids:
