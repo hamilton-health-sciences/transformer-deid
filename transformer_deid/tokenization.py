@@ -35,13 +35,25 @@ class _TqdmToLogger(io.StringIO):
         self.log = log
         self.level = level
         self._buf = ""
+        self._last = None
+
+    def _emit(self, text):
+        message = text.strip()
+        if message and message != self._last:
+            self.log.log(self.level, message)
+            self._last = message
 
     def write(self, buf):
-        self._buf = buf.rstrip("\r\n\t ")
+        for ch in buf:
+            if ch in ("\r", "\n"):
+                self._emit(self._buf)
+                self._buf = ""
+            else:
+                self._buf += ch
+        return len(buf)
 
     def flush(self):
-        if self._buf:
-            self.log.log(self.level, self._buf)
+        self._emit(self._buf)
         self._buf = ""
 
 
