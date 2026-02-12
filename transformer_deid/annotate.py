@@ -36,7 +36,15 @@ class _TqdmToLogger(io.StringIO):
 
 
 def _progress(iterable, total=None):
-    if os.isatty(2):
+    force_log_progress = os.getenv("PYCLIPSE_LOG_PROGRESS", "").strip().lower()
+    if force_log_progress in {"1", "true", "yes", "on"}:
+        use_tty = False
+    elif force_log_progress in {"0", "false", "no", "off"}:
+        use_tty = True
+    else:
+        use_tty = os.isatty(2)
+
+    if use_tty:
         return tqdm(iterable, total=total)
     return tqdm(
         iterable,
